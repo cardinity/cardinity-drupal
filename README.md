@@ -25,7 +25,7 @@ Cardinity is available for EU merchants of different types: from low to high ris
 
 We operate not only as a Payment Gateway but also as an Acquiring Bank. With over 10 years of experience in providing reliable online payment services, we continue to grow and improve as a perfect solution for your businesses.
 
-## Houw to apply
+## How to apply
 
 Register directly at our website [https://cardinity.com/sign-up](https://cardinity.com/sign-up).
 
