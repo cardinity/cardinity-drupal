@@ -1,0 +1,501 @@
+<?php
+
+/**
+ * @file
+ * Provides a Cardinity payment method for Drupal Commerce.
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_cardinity_commerce_payment_method_info() {
+  $payment_methods['cardinity'] = array(
+    'base' => 'commerce_cardinity',
+    'title' => t('Cardinity'),
+    'short_title' => t('Cardinity'),
+    'display_title' => t('Credit card'),
+    'description' => t('Integrates with Cardinity for secure on-site credit card payment.'),
+    'terminal' => FALSE,
+    'cardonfile' => array(
+      'delete callback' => 'commerce_cardinity_cardonfile_delete',
+      'charge callback' => 'commerce_cardinity_cardonfile_charge',
+    ),
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Returns the default Cardinity settings.
+ */
+function commerce_cardinity_default_settings() {
+  return array(
+    'consumer_key' => '',
+    'consumer_secret' => '',
+    'cardonfile' => FALSE,
+  );
+}
+
+/**
+ * Payment method callback: Cardinity settings form.
+ */
+function commerce_cardinity_settings_form($settings = array()) {
+  $form = array();
+
+  // Merge default settings into the stored settings array.
+  $settings = (array) $settings + commerce_cardinity_default_settings();
+
+  $form['consumer_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Consumer Key'),
+    '#default_value' => $settings['consumer_key'],
+    '#required' => TRUE,
+  );
+  $form['consumer_secret'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Consumer Secret'),
+    '#default_value' => $settings['consumer_secret'],
+    '#required' => TRUE,
+  );
+
+  if (module_exists('commerce_cardonfile')) {
+    $form['cardonfile'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Card on File functionality with this payment method.'),
+      '#default_value' => $settings['cardonfile'],
+    );
+  }
+  else {
+    $form['cardonfile'] = array(
+      '#type' => 'markup',
+      '#markup' => t('To enable Card on File functionality download and install the Card on File module.'),
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function commerce_cardinity_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  $credit_card_settings = array(
+    'owner' => '',
+    'number' => '',
+    'code' => '',
+  );
+
+  return commerce_payment_credit_card_form($credit_card_settings);
+}
+
+/**
+ * Payment method callback: submit form validation.
+ */
+function commerce_cardinity_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  if (module_exists('commerce_cardonfile') && isset($pane_values['cardonfile']) && is_numeric($pane_values['cardonfile'])) {
+    $card = commerce_cardonfile_load($pane_values['cardonfile']);
+    if ($card) {
+      // There is no need for validating a card on file, it already happened
+      // when the card had been saved.
+      return NULL;
+    }
+  }
+
+  // Validate credit card fields.
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+  $settings = array(
+    'form_parents' => array_merge($form_parents, array('credit_card')),
+  );
+  if (!commerce_payment_credit_card_validate($pane_values['credit_card'], $settings)) {
+    return FALSE;
+  }
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function commerce_cardinity_submit_form_submit($payment_method, $pane_form, $pane_values, &$order, $charge) {
+
+  if (module_exists('commerce_cardonfile') && isset($pane_values['cardonfile']) && is_numeric($pane_values['cardonfile'])) {
+
+    $cardonfile = $pane_values['cardonfile'];
+    $cardonfile_instance_default = $pane_values['cardonfile_instance_default'];
+
+    $card = commerce_cardonfile_load($cardonfile);
+
+    if ($cardonfile_instance_default) {
+      // Card in use is designated as default.
+      commerce_cardonfile_set_default_card($card->card_id);
+    }
+
+    return commerce_cardinity_cardonfile_charge($payment_method, $card, $order, $charge);
+  }
+
+  $amount = commerce_cardinity_price_amount($charge['amount'], $charge['currency_code']);
+
+  // Load customer profile.
+  $profile = commerce_customer_profile_load($order->commerce_customer_billing[LANGUAGE_NONE][0]['profile_id']);
+
+  // Get user billing address.
+  $billing_address = $profile->commerce_customer_address[LANGUAGE_NONE][0];
+
+  $payment_object = array(
+    'amount' => $amount,
+    'currency' => $charge['currency_code'],
+    'settle' => TRUE,
+    'order_id' => sprintf('%02d', $order->order_id),
+    'country' => $billing_address['country'],
+    'payment_method' => 'card',
+    'payment_instrument' => array(
+      'pan' => $pane_values['credit_card']['number'],
+      'exp_year' => $pane_values['credit_card']['exp_year'],
+      'exp_month' => $pane_values['credit_card']['exp_month'],
+      'cvc' => $pane_values['credit_card']['code'],
+      'holder' => $pane_values['credit_card']['owner'],
+    ),
+    'threeds2_data' =>  [
+      "notification_url" => url('commerce-cardinity/3d_secure_callback/' . $order->order_id, array('absolute' => TRUE)),
+      "browser_info" => [
+        "accept_header" => "text/html",
+        "browser_language" => "en-US",
+        "screen_width" => 600,
+        "screen_height" => 400,
+        'challenge_window_size' => "600x400",
+        "user_agent" => "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:21.0) Gecko/20100101 Firefox/21.0",
+        "color_depth" => 24,
+        "time_zone" => -60
+      ],
+    ],
+  );
+
+  $tokens = array();
+  $remote_status = 'PAYMENT';
+  $transaction = commerce_cardinity_transaction($payment_method, $order, $charge, $tokens, COMMERCE_PAYMENT_STATUS_PENDING, $remote_status);
+
+  // Send post.
+  $response = _commerce_cardinity_request_post($payment_method, $payment_object);
+
+  if (module_exists('commerce_cardonfile') && isset($pane_values['cardonfile'])) {
+    $response['cardonfile']['cardonfile_instance_default'] = $pane_values['cardonfile_instance_default'];
+    $response['cardonfile']['cardonfile_store'] = $pane_values['credit_card']['cardonfile_store'];
+  }
+
+  $result = commerce_cardinity_process_response($payment_method, $order, $response, $transaction);
+
+  return $result;
+}
+
+/**
+ * Send a POST request to cardinity and return the response as an array.
+ */
+function _commerce_cardinity_request_post($payment_method, $payment_object) {
+
+  module_load_include('php', 'commerce_cardinity', 'lib/CommerceCardinityOAuth');
+
+  $oauth = new CommerceCardinityOAuth($payment_method['settings']['consumer_key'], $payment_method['settings']['consumer_secret']);
+  $oauth->setAction('POST')->setPath('https://api.cardinity.com/v1/payments');
+
+  $options = array(
+    'method' => 'POST',
+    'data' => drupal_json_encode($payment_object),
+    'headers' => array(
+      'Content-Type' => 'application/json',
+      'Authorization' => $oauth->getHeaderString(),
+    ),
+  );
+
+  $result = drupal_http_request($oauth->path, $options);
+
+  $response = drupal_json_decode($result->data);
+
+  $response['response_code'] = $result->code;
+
+  return $response;
+}
+
+/**
+ * Helper function to process the response from cardinity.
+ *
+ * Return TRUE for a successful transaction.
+ *
+ * @param array $payment_method
+ *   The payment method being used.
+ * @param object $order
+ *   The Commerce Order to match against the response.
+ * @param array $tokens
+ *   Tokens available from the API response.
+ *
+ * @return bool
+ *   Return TRUE is the payment was successful.
+ *   Return FALSE if payment is rejected or fails for any reason.
+ */
+function commerce_cardinity_process_response(array $payment_method, $order, array $tokens, $transaction = NULL) {
+  // Default no charge for failed transactions.
+  $def_charge = array('amount' => 0, 'currency_code' => '');
+  $order_id = $order->order_id;
+  // Check for a valid status callback.
+  switch ($tokens['response_code']) {
+
+    case '400':
+      // Payment failed.
+      watchdog('commerce_cardinity', 'System FAIL from cardinity for order %order_id with message %msg', array('%order_id' => $order_id, '%msg' => $tokens['title']), WATCHDOG_ERROR);
+      commerce_cardinity_transaction($payment_method, $order, $def_charge, $tokens, COMMERCE_PAYMENT_STATUS_FAILURE, $tokens['status'], $transaction);
+      drupal_set_message(t('Sorry an error occurred while processing your transaction'), 'error');
+      if (!empty($tokens['errors'])) {
+        commerce_cardinity_display_errors($tokens['errors']);
+      }
+      return FALSE;
+
+    case '402':
+      // Payment declined.
+      watchdog('commerce_cardinity', 'System DECLINED from cardinity for order %order_id with message %msg', array('%order_id' => $order_id, '%msg' => $tokens['error']), WATCHDOG_ERROR);
+      commerce_cardinity_transaction($payment_method, $order, $def_charge, $tokens, COMMERCE_PAYMENT_STATUS_FAILURE, $tokens['status'], $transaction);
+      drupal_set_message(t('Sorry an error occurred while processing your transaction. %message', array('%message' => $tokens['error'])), 'error');
+      return FALSE;
+
+    case '201':
+      // Payment successful.
+      $arr_charge = array();
+      if (array_key_exists('amount', $tokens)) {
+        $arr_charge['amount'] = $tokens['amount'] * 100;
+        $arr_charge['currency_code'] = $tokens['currency'];
+      }
+      commerce_cardinity_transaction($payment_method, $order, $arr_charge, $tokens, COMMERCE_PAYMENT_STATUS_SUCCESS, $tokens['status'], $transaction);
+      break;
+
+    case '202':
+      // 3D security
+      // Server has replied with a 3D Secure authentication request.
+      // Store the returned variables in the order object for processing
+      // by the 3D Secure module
+      
+      if (isset($tokens['authorization_information'])) {
+        //Its 3ds v1, response should have data (PaReq) and url(AcsURL)
+        $tds_data = array();
+        $tds_data['3dsv'] = 1;
+        $tds_data['PAReq'] = $tokens['authorization_information']['data'];
+        $tds_data['ACSURL'] = $tokens['authorization_information']['url'];
+        $tds_data['MD'] = $tokens['id'];
+        $tds_data['TermUrl'] = url('commerce-cardinity/3d_secure_callback/' . $order->order_id, array('absolute' => TRUE));
+        $order->data['extra_authorisation'] = $tds_data;
+
+      } elseif (isset($tokens['threeds2_data'])) {
+        //its 3ds v2, response should have acs_url and creq
+        $tds_data = array();
+        $tds_data['3dsv'] = 2;
+        $tds_data['creq'] = $tokens['threeds2_data']['creq'];
+        $tds_data['acs_url'] = $tokens['threeds2_data']['acs_url'];
+        $tds_data['threeDSSessionData'] = $tokens['id'];
+        $order->data['extra_authorisation'] = $tds_data;
+      }
+      
+      $arr_charge = array();
+      if (array_key_exists('amount', $tokens)) {
+        $arr_charge['amount'] = $tokens['amount'] * 100;
+        $arr_charge['currency_code'] = $tokens['currency'];
+      }
+      commerce_cardinity_transaction($payment_method, $order, $arr_charge, $tokens, COMMERCE_PAYMENT_STATUS_PENDING, $tokens['status'], $transaction);
+      break;
+
+    default:
+      // Something has gone wrong so log an error and fail.
+      watchdog('commerce_cardinity', 'Unrecognised Status response from cardinity for order %order_id (%response_code)', array('%order_id' => $order_id, '%response_code' => $tokens['response_code']), WATCHDOG_ERROR);
+      commerce_cardinity_transaction($payment_method, $order, $def_charge, $tokens, COMMERCE_PAYMENT_STATUS_FAILURE, $tokens['status'], $transaction);
+      drupal_set_message(t('Sorry an error occurred while processing your transaction. %message', array('%message' => $tokens['title'])), 'error');
+      return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Implement support for Commerce Card on File.
+ *
+ * @param object $transaction
+ *   The transaction about to be saved.
+ */
+function commerce_cardinity_store_cardonfile($transaction) {
+  // Check if transaction payload contains a token.
+  if (!isset($transaction->payload['id'])) {
+    return;
+  }
+
+  // Check if the transaction status is not approved.
+  if ($transaction->payload['status'] !== 'approved') {
+    return;
+  }
+
+  // Check if the transaction has stored cardonfile information.
+  if (!isset($transaction->payload['cardonfile']) || !isset($transaction->payload['cardonfile']['cardonfile_store'])) {
+    return;
+  }
+
+  if (!$transaction->payload['cardonfile']['cardonfile_store']) {
+    return;
+  }
+
+  $order = commerce_order_load($transaction->order_id);
+  $uid = $order->uid;
+
+  if ($uid == 0) {
+    return;
+  }
+
+  $card_data = array(
+    'uid' => $uid,
+    'payment_method' => $transaction->payment_method,
+    'instance_id' => $transaction->instance_id,
+    'remote_id' => $transaction->payload['id'],
+    'card_type' => $transaction->payload['payment_instrument']['card_brand'],
+    'card_name' => $transaction->payload['payment_instrument']['holder'],
+    'card_number' => $transaction->payload['payment_instrument']['pan'],
+    'card_exp_year' => $transaction->payload['payment_instrument']['exp_year'],
+    'card_exp_month' => $transaction->payload['payment_instrument']['exp_month'],
+    'status' => 1,
+  );
+
+  $card_entity = commerce_cardonfile_new($card_data);
+  commerce_cardonfile_save($card_entity);
+  if (isset($transaction->payload['cardonfile']['cardonfile_instance_default']) && $transaction->payload['cardonfile']['cardonfile_instance_default']) {
+    commerce_cardonfile_set_default_card($card_entity->card_id);
+  }
+}
+
+/**
+ * Display translated payment errors.
+ *
+ * @param array $errors
+ *   The errors from Cardinity.
+ */
+function commerce_cardinity_display_errors(array $errors) {
+
+  foreach ($errors as $error) {
+    switch ($error['message']) {
+      case 'invalid credit card number.':
+        drupal_set_message(t('Invalid credit card number.'), 'error');
+        break;
+
+      case 'invalid cvc code.':
+        drupal_set_message(t('Invalid cvc code.'), 'error');
+        break;
+    }
+  }
+}
+
+/**
+ * Create a Transaction and associate it with the order.
+ *
+ * @param array $payment_method
+ *   The details of the payment method being used.
+ * @param object $order
+ *   The Commerce order associated with the transaction.
+ * @param array $charge
+ *   The charge details array including amount and currency.
+ * @param array $tokens
+ *   Tokens available for the transaction message.
+ * @param int $transaction_status
+ *   The transaction status (a constant defined by Drupal Commerce).
+ * @param string $remote_status
+ *   A String indicated the status of the transaction at Cardinity.
+ * @param object $transaction
+ *   If a transaction is being updated, this will be present.
+ */
+function commerce_cardinity_transaction(array $payment_method, $order, array $charge, array $tokens, $transaction_status, $remote_status, $transaction = NULL) {
+
+  if (!isset($transaction)) {
+    $transaction = commerce_payment_transaction_new($payment_method['method_id'], $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+    $transaction->amount = $charge['amount'];
+    $transaction->currency_code = $charge['currency_code'];
+  }
+  else {
+    $transaction->revision = 1;
+  }
+
+  $transaction->payload += $tokens;
+  $transaction->payload = array_merge($transaction->payload, $tokens);
+  if (array_key_exists('id', $tokens)) {
+    $transaction->remote_id = $tokens['id'];
+  }
+
+  $transaction->remote_status = $remote_status;
+  // Set a status for the payment - one of COMMERCE_PAYMENT_STATUS_SUCCESS,
+  // COMMERCE_PAYMENT_STATUS_PENDING or COMMERCE_PAYMENT_STATUS_FAILURE.
+  $transaction->status = $transaction_status;
+
+  $transaction_message = 'Status @status. ';
+  $transaction_message .= 'Card Type: @cardtype. ';
+  $transaction_message .= 'Last 4 Digits: @last4digits. ';
+  $transaction_message .= 'Holder: @holder. ';
+
+  $transaction->message = $transaction_message;
+  $transaction->message_variables = array(
+    '@status'        => isset($tokens['status']) ? $tokens['status'] : $transaction->status,
+    '@cardtype'      => isset($tokens['payment_instrument']['card_brand']) ? $tokens['payment_instrument']['card_brand'] : 'N/A',
+    '@last4digits'   => isset($tokens['payment_instrument']['pan']) ? $tokens['payment_instrument']['pan'] : 'N/A',
+    '@holder'   => isset($tokens['payment_instrument']['holder']) ? $tokens['payment_instrument']['holder'] : 'N/A',
+  );
+
+  if (module_exists('commerce_cardonfile'))
+    commerce_cardinity_store_cardonfile($transaction);
+  commerce_payment_transaction_save($transaction);
+  return $transaction;
+}
+
+/**
+ * Formats a price amount into a decimal value as expected by Cardinity.
+ *
+ * @param int $amount
+ *   An integer price amount.
+ * @param string $currency_code
+ *   The currency code of the price.
+ *
+ * @return string
+ *   The decimal price amount as expected by Braintree API servers.
+ */
+function commerce_cardinity_price_amount($amount, $currency_code) {
+  $rounded_amount = commerce_currency_round($amount, commerce_currency_load($currency_code));
+  return number_format(commerce_currency_amount_to_decimal($rounded_amount, $currency_code), 2, '.', '');
+}
+
+/**
+ * Implements hook_cardonfile_delete().
+ */
+function commerce_cardinity_cardonfile_delete($form, $form_state, $payment_method, $card_data) {
+  return TRUE;
+}
+
+/**
+ * Implements Card on File Charge Callback.
+ */
+function commerce_cardinity_cardonfile_charge($payment_method, $card_data, $order, $charge = NULL) {
+  $amount = commerce_cardinity_price_amount($charge['amount'], $charge['currency_code']);
+
+  // Load customer profile.
+  $profile = commerce_customer_profile_load($order->commerce_customer_billing[LANGUAGE_NONE][0]['profile_id']);
+
+  // Get user billing address.
+  $billing_address = $profile->commerce_customer_address[LANGUAGE_NONE][0];
+
+  $payment_object = array(
+    'amount' => $amount,
+    'currency' => $charge['currency_code'],
+    'settle' => TRUE,
+    'order_id' => sprintf('%02d', $order->order_id),
+    'country' => $billing_address['country'],
+    'payment_method' => 'recurring',
+    'payment_instrument' => array(
+      'payment_id' => $card_data->remote_id,
+    ),
+  );
+
+  $tokens = array();
+  $remote_status = 'PAYMENT';
+  $transaction = commerce_cardinity_transaction($payment_method, $order, $charge, $tokens, COMMERCE_PAYMENT_STATUS_PENDING, $remote_status);
+
+  // Send post.
+  $response = _commerce_cardinity_request_post($payment_method, $payment_object);
+
+  return commerce_cardinity_process_response($payment_method, $order, $response, $transaction);
+}

@@ -1,0 +1,7 @@
+name = Cardinity 3D Secure Support
+description = Adds an additional checkout step for direct payment method
+package = Commerce - Payment
+core = 7.x
+dependencies[] = commerce
+dependencies[] = commerce_order
+dependencies[] = commerce_cardinity

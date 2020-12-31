@@ -1,0 +1,6 @@
+name = Commerce Cardinity
+description = Integrates Cardinity for on-site credit card payment with Commerce Card on File support if available.
+package = Commerce - Payment
+core = 7.x
+dependencies[] = commerce_order
+dependencies[] = commerce_payment
